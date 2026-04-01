@@ -26,7 +26,7 @@ def hdr(cell, bg=C_HEADER_BG, fg=C_HEADER_FG, bold=True, sz=10):
     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     cell.border    = BRD
 
-# ── Helpers (Igual que antes) ───────────────────────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────
 def parse_monto(s):
     if s is None: return None
     s = re.sub(r"[\$\s]", "", str(s)).strip()
@@ -67,36 +67,6 @@ RE_MONTO_STR = re.compile(r"-?\(?\$?\s*[\d.]+,\d{2}\)?")
 RE_FECHA     = re.compile(r"^\d{2}/\d{2}/\d{2}$")
 RE_COMP      = re.compile(r"^\d{5,9}$")
 
-def extraer_info(pdf_file):
-    info = {}
-    with pdfplumber.open(pdf_file) as pdf:
-        texto = "\n".join(p.extract_text() or "" for p in pdf.pages)
-    for l in texto.splitlines():
-        l_strip = l.strip()
-        if not info.get("cuit"):
-            m = re.search(r"CUIT[:\s]+([\d\-]+)", l)
-            if m: info["cuit"] = m.group(1)
-        if not info.get("desde"):
-            m = re.search(r"Desde:\s*(\d{2}/\d{2}/\d{2})", l)
-            if m: info["desde"] = m.group(1)
-        if not info.get("hasta"):
-            m = re.search(r"Hasta:\s*(\d{2}/\d{2}/\d{2})", l)
-            if m: info["hasta"] = m.group(1)
-        if not info.get("nro_cuenta"):
-            m = re.search(r"N[°º]\s*([\d\-/]+)\s+CBU:\s*(\d+)", l)
-            if m:
-                info["nro_cuenta"] = m.group(1)
-                info["cbu"]        = m.group(2)
-        if not info.get("saldo_inicial"):
-            m = re.search(r"Saldo Inicial\s+\$\s*([\d.,]+)", l)
-            if m: info["saldo_inicial"] = parse_monto(m.group(1))
-        if not info.get("razon_social") and (info.get("cuit") or info.get("nro_cuenta")):
-            if (re.match(r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s\.\-&,]+$", l_strip)
-                    and 4 < len(l_strip) < 60
-                    and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA")):
-                info["razon_social"] = l_strip
-    return info
-
 def _parsear_importes(montos_str, desc, saldo_anterior=None):
     vals = [(parse_monto(m), m) for m in montos_str]
     vals = [(v, raw) for v, raw in vals if v is not None]
@@ -130,15 +100,10 @@ def _parsear_importes(montos_str, desc, saldo_anterior=None):
         saldo = vals[0][0]
     return debito, credito, saldo
 
-def extraer_movimientos_texto(pdf_file, saldo_inicial=None):
-    with pdfplumber.open(pdf_file) as pdf:
-        todas = []
-        for page in pdf.pages:
-            todas.extend((page.extract_text() or "").splitlines())
-
+def procesar_lineas_movimientos(todas_las_lineas, saldo_inicial):
     lineas = []
     cap = False
-    for l in todas:
+    for l in todas_las_lineas:
         if "Movimientos en pesos" in l:
             cap = True
             continue
@@ -199,6 +164,69 @@ def extraer_movimientos_texto(pdf_file, saldo_inicial=None):
         i += 1
     return movimientos
 
+def extraer_pdf_multicuenta(pdf_file):
+    with pdfplumber.open(pdf_file) as pdf:
+        todas = []
+        for page in pdf.pages:
+            todas.extend((page.extract_text() or "").splitlines())
+
+    # 1. Info global del cliente
+    info_global = {"cuit": "", "desde": "", "hasta": "", "razon_social": ""}
+    for l in todas:
+        l_strip = l.strip()
+        if not info_global["cuit"]:
+            m = re.search(r"CUIT[:\s]+([\d\-]+)", l)
+            if m: info_global["cuit"] = m.group(1)
+        if not info_global["desde"]:
+            m = re.search(r"Desde:\s*(\d{2}/\d{2}/\d{2})", l)
+            if m: info_global["desde"] = m.group(1)
+        if not info_global["hasta"]:
+            m = re.search(r"Hasta:\s*(\d{2}/\d{2}/\d{2})", l)
+            if m: info_global["hasta"] = m.group(1)
+        if not info_global["razon_social"] and info_global["cuit"]:
+            if (re.match(r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s\.\-&,]+$", l_strip)
+                    and 4 < len(l_strip) < 60
+                    and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA")):
+                info_global["razon_social"] = l_strip
+
+    # 2. Separar lineas por cuenta
+    cuentas = {}
+    cuenta_actual = None
+
+    for l in todas:
+        m = re.search(r"N[°º]\s*([\d\-/]+)\s+CBU:\s*(\d+)", l)
+        if m:
+            cta = m.group(1)
+            cbu = m.group(2)
+            if cta != cuenta_actual:
+                cuenta_actual = cta
+                if cta not in cuentas:
+                    cuentas[cta] = {"nro_cuenta": cta, "cbu": cbu, "saldo_inicial": None, "lineas": []}
+        if cuenta_actual:
+            cuentas[cuenta_actual]["lineas"].append(l)
+
+    # 3. Procesar cada cuenta individualmente
+    resultados = []
+    for cta, datos in cuentas.items():
+        for l in datos["lineas"]:
+            m = re.search(r"Saldo Inicial\s+\$\s*([\d.,]+)", l)
+            if m and datos["saldo_inicial"] is None:
+                datos["saldo_inicial"] = parse_monto(m.group(1))
+
+        movimientos = procesar_lineas_movimientos(datos["lineas"], datos["saldo_inicial"])
+
+        info_completa = {
+            **info_global,
+            "nro_cuenta": datos["nro_cuenta"],
+            "cbu": datos["cbu"],
+            "saldo_inicial": datos["saldo_inicial"]
+        }
+
+        if movimientos:
+            resultados.append({"info": info_completa, "movimientos": movimientos})
+
+    return resultados
+
 # ── Creación del Excel en Memoria ───────────────────────────────────────────
 def crear_excel_buffer(info, movimientos):
     wb = Workbook()
@@ -235,7 +263,6 @@ def crear_excel_buffer(info, movimientos):
                 cell.number_format, cell.alignment = '#,##0.00;[Red](#,##0.00);-', Alignment(horizontal="right")
         fila += 1
 
-    # Guardar en buffer de memoria para descargar en la web
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -246,30 +273,36 @@ def crear_excel_buffer(info, movimientos):
 st.set_page_config(page_title="Santander a Excel", page_icon="🏦", layout="centered")
 
 st.title("🏦 Conversor Santander a Excel")
-st.write("Subí tus extractos en PDF y descargá el archivo conciliado en Excel al instante.")
+st.write("Subí tus extractos en PDF. Si el archivo tiene varias cuentas adentro, te generaremos un Excel separado para cada una.")
 
 uploaded_files = st.file_uploader("Arrastrá los PDF acá", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files:
     if st.button("Procesar Archivos", type="primary"):
         for file in uploaded_files:
-            with st.spinner(f"Procesando {file.name}..."):
+            with st.spinner(f"Escaneando {file.name}..."):
                 try:
-                    info = extraer_info(file)
-                    file.seek(0) # Reseteamos el lector del PDF
-                    movimientos = extraer_movimientos_texto(file, info.get("saldo_inicial"))
+                    resultados = extraer_pdf_multicuenta(file)
                     
-                    if movimientos:
-                        excel_buffer = crear_excel_buffer(info, movimientos)
-                        nombre_excel = file.name.replace(".pdf", ".xlsx")
+                    if resultados:
+                        st.success(f"✅ {file.name} escaneado: ¡Se detectaron {len(resultados)} cuenta(s) adentro!")
                         
-                        st.success(f"✅ {file.name} procesado con éxito ({len(movimientos)} movimientos)")
-                        st.download_button(
-                            label=f"📥 Descargar {nombre_excel}",
-                            data=excel_buffer,
-                            file_name=nombre_excel,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+                        # Generar un botón de descarga por cada cuenta encontrada
+                        for res in resultados:
+                            info = res["info"]
+                            movs = res["movimientos"]
+                            excel_buffer = crear_excel_buffer(info, movs)
+                            
+                            cuenta_limpia = info['nro_cuenta'].replace('/', '-')
+                            nombre_excel = f"Extracto_{cuenta_limpia}.xlsx"
+                            
+                            st.download_button(
+                                label=f"📥 Descargar Excel — Cuenta {info['nro_cuenta']} ({len(movs)} movs)",
+                                data=excel_buffer,
+                                file_name=nombre_excel,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key=f"{file.name}_{cuenta_limpia}" # ID único para que Streamlit no se confunda
+                            )
                     else:
                         st.warning(f"⚠️ No se detectaron movimientos en {file.name}.")
                 except Exception as e:
