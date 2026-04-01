@@ -49,7 +49,7 @@ def categorizar(d):
     return "Otros"
 
 # ── Lógica de Extracción ────────────────────────────────────────────────────
-RE_MONTO_STR = re.compile(r"-?\(?(?:U\$S|US\$|\$)?\s*[\d.]+,\d{2}\)?")
+RE_MONTO_STR = re.compile(r"-?\(?(?:U\$S|US\$|USS|\$)?\s*[\d.]+,\d{2}\)?")
 RE_FECHA     = re.compile(r"^\d{2}/\d{2}/\d{2}$")
 RE_COMP      = re.compile(r"^\d{5,9}$")
 
@@ -108,7 +108,7 @@ def procesar_lineas_movimientos(lineas):
     idx_start = 0
     fecha_corriente = ""
 
-    # 1. Atrapar el Saldo Inicial
+    # 1. Atrapar el Saldo Inicial y su monto exacto
     idx_saldo = -1
     for i, l in enumerate(lineas):
         if "saldo inicial" in l.lower() or "saldo en cuenta" in l.lower():
@@ -143,7 +143,7 @@ def procesar_lineas_movimientos(lineas):
             })
             fecha_corriente = fecha_inicial
 
-    # 2. Procesar Movimientos
+    # 2. Procesar el resto de los Movimientos protegidos
     i = idx_start
     while i < len(lineas):
         l = lineas[i].strip()
@@ -152,13 +152,12 @@ def procesar_lineas_movimientos(lineas):
             continue
 
         l_lower = l.lower()
+        # Filtros de basura interna
         if (re.match(r"^\d+\s*-\s*\d+$", l) or
             ("fecha" in l_lower and "comprobante" in l_lower) or
             ("cuenta corriente" in l_lower and "cbu" in l_lower) or
             l.startswith("* Salvo") or
-            l_lower.startswith("total") or
-            "saldo total" in l_lower or
-            "no tenés movimientos" in l_lower or
+            l_lower == "santander" or
             "saldo inicial" in l_lower):
             i += 1
             continue
@@ -194,8 +193,6 @@ def procesar_lineas_movimientos(lineas):
             sig_lower = sig.lower()
             if (sig and not RE_MONTO_STR.findall(sig) and
                 not RE_FECHA.match(sig) and
-                not sig_lower.startswith("total") and
-                not "saldo total" in sig_lower and
                 not re.match(r"^\d+\s*-\s*\d+$", sig)):
                 desc = (desc + " | " + sig) if desc else sig
                 i += 1
@@ -220,15 +217,17 @@ def extraer_pdf_multicuenta(pdf_file):
     info_global = {"cuit": "", "desde": "", "hasta": "", "razon_social": ""}
     cuentas = {}
     cuenta_actual = None
+    leyendo_movimientos = False  # El "Candado"
 
     for l in todas:
         l_strip = l.strip()
+        l_lower = l_strip.lower()
 
-        # AQUÍ ESTÁ EL FRENO DE MANO QUE ARREGLA TODO:
-        # Si leemos esto, cortamos la extracción de raíz para que no mezcle datos.
-        if "detalle impositivo" in l_strip.lower() or "legales" in l_strip.lower():
+        # Freno de mano absoluto para la sección final del PDF
+        if "detalle impositivo" in l_lower or "legales" in l_lower or "intercambio de información" in l_lower:
             break
 
+        # Info Global
         if not info_global["cuit"]:
             m = re.search(r"CUIT[:\s]+([\d\-]+)", l_strip)
             if m: info_global["cuit"] = m.group(1)
@@ -244,16 +243,32 @@ def extraer_pdf_multicuenta(pdf_file):
                     and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA")):
                 info_global["razon_social"] = l_strip
 
+        # 1. Detectar un CBU nuevo (Abre el candado)
         m_cta = re.search(r"N[°ºoO]?\s*([\d\-/]+)\s+CBU:\s*(\d+)", l_strip)
         if m_cta:
             cta = m_cta.group(1)
             cbu = m_cta.group(2)
             cuenta_actual = cta
+            leyendo_movimientos = True # Se abre el candado para esta cuenta
             if cta not in cuentas:
                 cuentas[cta] = {"nro_cuenta": cta, "cbu": cbu, "lineas": []}
             continue
 
-        if cuenta_actual:
+        # 2. Si el candado está abierto, verificamos si hay que cerrarlo
+        if cuenta_actual and leyendo_movimientos:
+            # Si leemos "Total", "Saldo total" o "No tenés movimientos", CERRAR CANDADO
+            es_fin_tabla = (
+                re.match(r"^total\s*(?:u\$s|us\$|uss|\$)?\s*[\d.,]*$", l_lower) or
+                re.match(r"^saldo total\s*(?:u\$s|us\$|uss|\$)?\s*[\d.,]*$", l_lower) or
+                "no tenés movimientos" in l_lower or
+                "no tenes movimientos" in l_lower
+            )
+            
+            if es_fin_tabla:
+                leyendo_movimientos = False
+                continue # Ignoramos esta línea y las siguientes hasta el próximo CBU
+            
+            # Si no se cerró, es un movimiento real, lo guardamos
             cuentas[cuenta_actual]["lineas"].append(l_strip)
 
     resultados = []
@@ -266,6 +281,7 @@ def extraer_pdf_multicuenta(pdf_file):
             "cbu": datos["cbu"]
         }
         
+        # Ignorar cuentas que solo trajeron la info del Saldo Inicial pero ningún movimiento real
         movs_reales = [m for m in movimientos if "saldo inicial" not in m["descripcion"].lower()]
         if movs_reales:
             resultados.append({"info": info_completa, "movimientos": movimientos})
