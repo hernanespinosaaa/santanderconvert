@@ -29,16 +29,11 @@ BRD  = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 # ── Regex globales ────────────────────────────────────────────────────────────
 RE_MONTO_AR  = re.compile(r"-?\$\s*[\d.]+,\d{2}")
-RE_MONTO_USD = re.compile(r"U\$S\s*[\d.]+,\d{2}")
+RE_MONTO_USD = re.compile(r"-?U\$S\s*[\d.]+,\d{2}", re.IGNORECASE)
 RE_FECHA     = re.compile(r"^\d{2}/\d{2}/\d{2}$")
 RE_CBU       = re.compile(r"N[°ºoO]?\s*([\d\-/]+)\s+CBU:\s*(\d+)", re.IGNORECASE)
 RE_COMP      = re.compile(r"^\d{5,9}$")
 RE_PAG       = re.compile(r"^\d+\s*-\s*\d+$")
-
-STOP_PALABRAS = (
-    "detalle impositivo", "legales", "intercambio de información",
-    "movimientos en dólares", "saldo total",
-)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def parse_monto(s: str) -> float | None:
@@ -132,8 +127,12 @@ def extraer_cuentas_del_pdf(pdf_file) -> tuple[dict, list[dict]]:
         ls = l.strip()
         ll = ls.lower()
 
-        # Parar en secciones no contables
-        if any(sw in ll for sw in STOP_PALABRAS):
+        # Freno estricto para no mezclar texto basura o impuestos al final de las cuentas
+        es_fin = (
+            re.match(r"^(detalle impositivo|legales|intercambio de información|movimientos en dólares|saldo total)", ll) or
+            re.match(r"^total\s*(u\$s|\$|$)", ll)
+        )
+        if es_fin:
             capturando = False
             cuenta_act = None
             continue
@@ -143,7 +142,6 @@ def extraer_cuentas_del_pdf(pdf_file) -> tuple[dict, list[dict]]:
         if m and "Fecha" not in ls:
             nro = m.group(1)
             cbu = m.group(2)
-            # Detectar moneda por el contexto cercano (U$S o no)
             moneda = "U$S" if "U$S" in ls or "dólares" in ll else "$"
             cuenta_act = nro
             capturando = True
@@ -155,15 +153,11 @@ def extraer_cuentas_del_pdf(pdf_file) -> tuple[dict, list[dict]]:
         if not capturando or not cuenta_act:
             continue
 
-        # Filtros de ruido
+        # Filtros de ruido interno
         if (RE_PAG.match(ls)
                 or ("Fecha" in ls and "Comprobante" in ls)
                 or ls.lower().startswith("* salvo")
-                or re.match(r"^total\s*(u\$s|\$|$)", ll)
                 or not ls):
-            if re.match(r"^total\s*(u\$s|\$|$)", ll):
-                capturando = False
-                cuenta_act = None
             continue
 
         cuentas[cuenta_act]["lineas"].append(ls)
@@ -173,45 +167,46 @@ def extraer_cuentas_del_pdf(pdf_file) -> tuple[dict, list[dict]]:
 
 # ── Parser de movimientos ─────────────────────────────────────────────────────
 def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
-    """
-    Convierte líneas de texto a lista de movimientos.
-
-    Patrón real del PDF Santander:
-      LÍNEA A: [DD/MM/AA] [comprobante] descripcion  $importe  $saldo
-      LÍNEA B: beneficiario/referencia  (sin montos, opcional)
-      LÍNEA C: DD/MM/AA sola            ← fecha del movimiento de LÍNEA A cuando no viene en ella
-
-    La fecha suelta que aparece DESPUÉS de un bloque de movimiento
-    pertenece a ese movimiento, no al siguiente.
-
-    Clasificación débito/crédito por validación matemática:
-      saldo_anterior + importe = saldo_posterior
-      Si la diferencia es positiva → crédito; negativa → débito.
-    """
     RE_M = RE_MONTO_AR if moneda == "$" else RE_MONTO_USD
     movimientos: list[dict] = []
     saldo_actual: float | None = None
+    fecha_corriente = ""
     i = 0
 
-    # ── Saldo inicial ────────────────────────────────────────────────────────
+    # ── Saldo inicial (Búsqueda profunda en multilínea) ─────────────────────
+    idx_saldo = -1
     for j, l in enumerate(lineas):
-        if "saldo inicial" in l.lower():
-            ms = RE_M.findall(l)
-            if ms:
-                saldo_actual = parse_monto(ms[-1])
-                mf = RE_FECHA.search(l)
-                movimientos.append({
-                    "fecha":        mf.group(0) if mf else "",
-                    "comprobante":  "",
-                    "descripcion":  "Saldo Inicial",
-                    "debito":       None,
-                    "credito":      None,
-                    "saldo":        saldo_actual,
-                    "categoria":    "Saldo Inicial",
-                    "sin_fecha":    not bool(mf),
-                })
-                i = j + 1
+        if "saldo inicial" in l.lower() or "saldo en cuenta" in l.lower():
+            idx_saldo = j
             break
+            
+    if idx_saldo != -1:
+        fecha_inicial = ""
+        for l in lineas[max(0, idx_saldo-2) : idx_saldo+3]:
+            m_fecha = RE_FECHA.search(l)
+            if m_fecha:
+                fecha_inicial = m_fecha.group(0)
+                break
+                
+        for j in range(idx_saldo, min(len(lineas), idx_saldo+4)):
+            montos = RE_M.findall(lineas[j])
+            if montos:
+                saldo_actual = parse_monto(montos[-1])
+                i = j + 1
+                break
+                
+        if saldo_actual is not None:
+            movimientos.append({
+                "fecha":        fecha_inicial,
+                "comprobante":  "",
+                "descripcion":  "Saldo Inicial",
+                "debito":       None,
+                "credito":      None,
+                "saldo":        saldo_actual,
+                "categoria":    "Saldo Inicial",
+                "sin_fecha":    not bool(fecha_inicial),
+            })
+            fecha_corriente = fecha_inicial
 
     # ── Movimientos ──────────────────────────────────────────────────────────
     while i < len(lineas):
@@ -220,17 +215,15 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
 
         if not l or RE_PAG.match(l):
             continue
-        if "no tenés movimientos" in l.lower():
+        if "no tenés movimientos" in l.lower() or re.match(r"^total\b", l.lower()):
             continue
-        if re.match(r"^total\b", l.lower()):
-            break
-        # Fecha suelta que no pertenece a ningún bloque en curso → ignorar
+        # Evita consumir fechas sueltas que no tengan importes
         if RE_FECHA.match(l):
+            fecha_corriente = l
             continue
 
         montos_raw = RE_M.findall(l)
         if not montos_raw:
-            # Texto de beneficiario/referencia: agregar al movimiento anterior
             if movimientos and movimientos[-1]["categoria"] != "Saldo Inicial":
                 movimientos[-1]["descripcion"] += " | " + l
                 movimientos[-1]["categoria"] = categorizar(movimientos[-1]["descripcion"])
@@ -241,6 +234,7 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
         tokens = sin_m.split()
         fecha = comp = ""
         desc_t: list[str] = []
+        
         for t in tokens:
             if not fecha and RE_FECHA.match(t):
                 fecha = t
@@ -248,32 +242,30 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
                 comp = t
             else:
                 desc_t.append(t)
+                
+        # Memoria de fechas para los movimientos del mismo día sin fecha impresa
+        if fecha:
+            fecha_corriente = fecha
+        else:
+            fecha = fecha_corriente
+            
         desc = " ".join(desc_t).strip()
 
-        # Mirar las líneas siguientes para capturar beneficiario y/o fecha suelta
-        # Patrón: [beneficiario_texto?] [fecha_sola?]
-        # La fecha suelta cierra el bloque del movimiento actual.
         j = i
         while j < len(lineas):
             sig = lineas[j].strip()
-            if not sig or RE_PAG.match(sig):
+            if not sig or RE_PAG.match(sig) or re.match(r"^total\b", sig.lower()):
                 j += 1
                 continue
-            if re.match(r"^total\b", sig.lower()):
-                break
             if RE_M.findall(sig):
-                # Siguiente movimiento con montos → salir sin consumir
                 break
             if RE_FECHA.match(sig):
-                # Fecha suelta: asignar al movimiento actual si no tenía
                 if not fecha:
                     fecha = sig
-                j += 1  # consumir la línea de fecha
+                j += 1 
                 break
-            # Es texto de beneficiario/referencia
             desc = (desc + " | " + sig) if desc else sig
             j += 1
-            # Después del beneficiario puede venir una fecha suelta: continuar el loop
         i = j
 
         # ── Parsear importes ─────────────────────────────────────────────────
@@ -285,30 +277,29 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
             saldo   = vals[-1]
             abs_imp = abs(importe)
 
-            # 1. Validación matemática (principal)
+            # 1. Validación matemática
             if saldo_actual is not None:
                 dif = round(saldo - saldo_actual, 2)
                 if abs(abs(dif) - round(abs_imp, 2)) < 0.02:
                     credito = abs_imp if dif > 0 else None
                     debito  = abs_imp if dif <= 0 else None
                 else:
-                    # 2. Fallback por descripción / signo
+                    # 2. Fallback por palabras si la matemática falla
                     desc_l = desc.lower()
-                    if "rescate" in desc_l:
+                    if importe < 0:
+                        debito = abs_imp
+                    elif any(k in desc_l for k in (
+                        "rescate", "recibida", "credi", "crédi", "acreditacion", 
+                        "acreditación", "deposito", "reintegro", "devolucion", 
+                        "liquidacion titulos publicos credi"
+                    )):
                         credito = abs_imp
                     elif "suscripcion" in desc_l or "suscripción" in desc_l:
                         debito = abs_imp
-                    elif importe < 0:
-                        debito = abs_imp
-                    elif any(k in desc_l for k in (
-                        "recibida", "credi transf", "crédito transf",
-                        "credito transf", "liquidacion titulos publicos credi",
-                    )):
-                        credito = abs_imp
                     else:
                         debito = abs_imp
             else:
-                debito = abs_imp  # sin saldo anterior, asumir débito
+                debito = abs_imp 
 
         elif vals:
             saldo = vals[0]
@@ -474,7 +465,7 @@ def crear_excel(info: dict, movimientos: list[dict], moneda: str = "$") -> bytes
         ("Período Hasta", info.get("hasta", "")),
         ("Saldo Inicial", movimientos[0]["saldo"] if movimientos else ""),
         ("Saldo Final",   saldo_final),
-        ("Total Movim.",  len(movimientos) - 1),   # excluir saldo inicial
+        ("Total Movim.",  len(movimientos) - 1),
         ("Generado",      datetime.now().strftime("%d/%m/%Y %H:%M")),
     ]
     for idx, (k, v) in enumerate(campos, 2):
@@ -491,10 +482,6 @@ def crear_excel(info: dict, movimientos: list[dict], moneda: str = "$") -> bytes
 
 # ── Procesamiento completo de un PDF ──────────────────────────────────────────
 def procesar_pdf(pdf_file) -> list[dict]:
-    """
-    Retorna lista de resultados, uno por cuenta con movimientos.
-    Cada resultado: {"info": {...}, "movimientos": [...], "moneda": "..."}
-    """
     info_global, cuentas = extraer_cuentas_del_pdf(pdf_file)
     resultados = []
 
@@ -539,9 +526,7 @@ html, body, [class*="css"] {
 }
 
 /* Fondo general */
-.stApp {
-    background: #f8f6f2;
-}
+.stApp { background: #f8f6f2; }
 
 /* Ocultar elementos default de Streamlit */
 #MainMenu, footer, header { visibility: hidden; }
@@ -623,9 +608,7 @@ html, body, [class*="css"] {
     border-radius: 20px;
     letter-spacing: 0.5px;
 }
-.result-badge-usd {
-    background: #1a5276;
-}
+.result-badge-usd { background: #1a5276; }
 .result-account {
     font-family: 'IBM Plex Mono', monospace;
     font-size: 1.05rem;
@@ -633,10 +616,7 @@ html, body, [class*="css"] {
     color: #1a1a1a;
     margin-bottom: 2px;
 }
-.result-meta {
-    font-size: 0.78rem;
-    color: #888;
-}
+.result-meta { font-size: 0.78rem; color: #888; }
 .stat-row {
     display: flex;
     gap: 16px;
@@ -675,9 +655,7 @@ html, body, [class*="css"] {
     margin-top: 10px !important;
     transition: background 0.15s !important;
 }
-.stDownloadButton button:hover {
-    background: #a80000 !important;
-}
+.stDownloadButton button:hover { background: #a80000 !important; }
 
 /* Botón procesar */
 .stButton button {
@@ -701,9 +679,7 @@ html, body, [class*="css"] {
 .stSpinner > div { border-top-color: #CC0000 !important; }
 
 /* File uploader */
-[data-testid="stFileUploader"] {
-    background: transparent !important;
-}
+[data-testid="stFileUploader"] { background: transparent !important; }
 
 /* Expander */
 .streamlit-expanderHeader {
@@ -778,7 +754,6 @@ if uploaded_files:
             try:
                 resultados = procesar_pdf(file)
                 if resultados:
-                    # Generar bytes de Excel para cada cuenta
                     for res in resultados:
                         res["excel_bytes"] = crear_excel(
                             res["info"], res["movimientos"], res["moneda"]
@@ -826,11 +801,9 @@ if uploaded_files:
             movs   = res["movimientos"]
             moneda = res["moneda"]
 
-            # Calcular estadísticas
             movs_reales = [m for m in movs if m["categoria"] != "Saldo Inicial"]
             total_deb   = sum(m["debito"]  or 0 for m in movs_reales)
             total_cred  = sum(m["credito"] or 0 for m in movs_reales)
-            saldo_ini   = movs[0]["saldo"] if movs and movs[0]["categoria"] == "Saldo Inicial" else None
             saldo_fin   = movs[-1]["saldo"] if movs else None
 
             sim         = moneda
@@ -872,7 +845,6 @@ if uploaded_files:
             </div>
             """, unsafe_allow_html=True)
 
-            # Nombre del archivo Excel
             periodo = f"{info.get('desde','').replace('/','')}-{info.get('hasta','').replace('/','')}"
             nro_safe = nro_display.replace("/", "-")
             nombre_xlsx = f"Cta_{nro_safe}_{periodo}.xlsx"
@@ -886,7 +858,6 @@ if uploaded_files:
                 use_container_width=True,
             )
 
-    # ── Leyenda de colores ────────────────────────────────────────────────────
     if any(d["ok"] for d in st.session_state.resultados_por_archivo.values()):
         with st.expander("📋  Leyenda de colores del Excel"):
             st.markdown("""
@@ -898,4 +869,3 @@ if uploaded_files:
                 <span><span class="legend-dot" style="background:#FFF3CD"></span>Sin fecha detectada</span>
             </div>
             """, unsafe_allow_html=True)
-
