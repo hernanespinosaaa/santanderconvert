@@ -1,40 +1,71 @@
-import streamlit as st
-import pdfplumber
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+#!/usr/bin/env python3
+"""
+Conversor Santander PDF → Excel
+Streamlit app · Parser basado en validación matemática de saldos
+"""
+
 import re
 import io
 from datetime import datetime
 
-# ── Paleta y Estilos ────────────────────────────────────────────────────────
-C_HEADER_BG = "CC0000"
-C_HEADER_FG = "FFFFFF"
-C_SUBHEADER = "F2F2F2"
-C_DEBITO    = "FFF0F0"
-C_CREDITO   = "F0FFF0"
-C_IMPUESTO  = "FFF8E1"
-C_TOTAL_BG  = "EEEEEE"
-C_WARN      = "FFF3CD"
+import pdfplumber
+import streamlit as st
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ── Constantes de color Excel ─────────────────────────────────────────────────
+C_HEADER_BG  = "CC0000"
+C_HEADER_FG  = "FFFFFF"
+C_SUBHEADER  = "F2F2F2"
+C_DEBITO     = "FFF0F0"
+C_CREDITO    = "F0FFF0"
+C_IMPUESTO   = "FFF8E1"
+C_TOTAL_BG   = "EEEEEE"
+C_SALDO_INIT = "EEF2FF"
 
 THIN = Side(style="thin", color="CCCCCC")
 BRD  = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
-def hdr(cell, bg=C_HEADER_BG, fg=C_HEADER_FG, bold=True, sz=10):
-    cell.font      = Font(name="Arial", bold=bold, color=fg, size=sz)
-    cell.fill      = PatternFill("solid", fgColor=bg)
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    cell.border    = BRD
+# ── Regex globales ────────────────────────────────────────────────────────────
+RE_MONTO_AR  = re.compile(r"-?\$\s*[\d.]+,\d{2}")
+RE_MONTO_USD = re.compile(r"U\$S\s*[\d.]+,\d{2}")
+RE_FECHA     = re.compile(r"^\d{2}/\d{2}/\d{2}$")
+RE_CBU       = re.compile(r"N[°ºoO]?\s*([\d\-/]+)\s+CBU:\s*(\d+)", re.IGNORECASE)
+RE_COMP      = re.compile(r"^\d{5,9}$")
+RE_PAG       = re.compile(r"^\d+\s*-\s*\d+$")
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
-def categorizar(d):
+STOP_PALABRAS = (
+    "detalle impositivo", "legales", "intercambio de información",
+    "movimientos en dólares", "saldo total",
+)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def parse_monto(s: str) -> float | None:
+    if not s:
+        return None
+    s = s.strip()
+    neg = s.startswith("-")
+    s = re.sub(r"[^\d,.]", "", s)
+    if not s:
+        return None
+    if re.search(r",\d{2}$", s):
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        v = float(s)
+        return -v if neg else v
+    except ValueError:
+        return None
+
+
+def categorizar(d: str) -> str:
     d = d.lower()
     if "saldo inicial" in d:                           return "Saldo Inicial"
     if "haberes" in d or "sueldo" in d:                return "Sueldos y haberes"
     if "honorario" in d or "/ hon" in d:               return "Honorarios"
     if "alquiler" in d or "/ alq" in d:                return "Alquileres"
     if "afip" in d or "imp.afp" in d:                  return "Impuestos AFIP"
-    if "ley 25.413" in d or "debito 0,6" in d:         return "Imp. débitos/créditos"
+    if "ley 25.413" in d:                              return "Imp. débitos/créditos"
     if "ii bb" in d or "iibb" in d:                    return "IIBB"
     if "iva" in d:                                     return "IVA"
     if "fondos comunes" in d or "rescate" in d:        return "FCI"
@@ -46,345 +77,812 @@ def categorizar(d):
     if "transferencia" in d or "transf" in d:          return "Transferencias"
     if "acreditacion" in d or "acreditación" in d:     return "Acreditaciones"
     if "cheque" in d or "echeq" in d:                  return "Cheques"
+    if "liquidacion titulos" in d:                     return "Títulos/Bonos"
+    if "pago de servicios" in d or "snp" in d:         return "Servicios"
+    if "pago tarjeta" in d:                            return "Tarjeta de crédito"
     return "Otros"
 
-# ── Lógica de Extracción ────────────────────────────────────────────────────
-RE_MONTO_STR = re.compile(r"-?\(?(?:U\$S|US\$|USS|\$)?\s*[\d.]+,\d{2}\)?")
-RE_FECHA     = re.compile(r"^\d{2}/\d{2}/\d{2}$")
-RE_COMP      = re.compile(r"^\d{5,9}$")
 
-def parse_monto(s):
-    if s is None: return None
-    s = re.sub(r"[^\d.,\-()]", "", str(s)).strip()
-    if not s: return None
-    negativo = s.startswith("-") or (s.startswith("(") and s.endswith(")"))
-    s = s.lstrip("-(").rstrip(")")
-    if re.search(r",\d{2}$", s):
-        s = s.replace(".", "").replace(",", ".")
-    else:
-        s = s.replace(",", "")
-    try:
-        v = float(s)
-        return -v if negativo else v
-    except ValueError:
-        return None
+# ── Extracción de info global ─────────────────────────────────────────────────
+def extraer_info_global(lineas: list[str]) -> dict:
+    info = {"cuit": "", "desde": "", "hasta": "", "razon_social": ""}
+    for l in lineas:
+        ls = l.strip()
+        if not info["cuit"]:
+            m = re.search(r"CUIT[:\s]+([\d\-]+)", ls)
+            if m:
+                info["cuit"] = m.group(1)
+        if not info["desde"]:
+            m = re.search(r"Desde:\s*(\d{2}/\d{2}/\d{2})", ls)
+            if m:
+                info["desde"] = m.group(1)
+        if not info["hasta"]:
+            m = re.search(r"Hasta:\s*(\d{2}/\d{2}/\d{2})", ls)
+            if m:
+                info["hasta"] = m.group(1)
+        if not info["razon_social"] and info["cuit"]:
+            if (re.match(r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s\.\-&,]+$", ls)
+                    and 4 < len(ls) < 60
+                    and ls not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE",
+                                   "BANCO SANTANDER", "RESUMEN DE CUENTA")):
+                info["razon_social"] = ls
+    return info
 
-def _parsear_importes(montos_str, desc, saldo_anterior=None):
-    vals = [(parse_monto(m), m) for m in montos_str]
-    vals = [(v, raw) for v, raw in vals if v is not None]
-    debito = credito = saldo = None
-    desc_l = desc.lower()
 
-    if len(vals) >= 2:
-        importe, raw_importe = vals[-2]
-        saldo, _             = vals[-1]
-        importe_abs = abs(importe)
+# ── Extracción multicuenta ────────────────────────────────────────────────────
+def extraer_cuentas_del_pdf(pdf_file) -> tuple[dict, list[dict]]:
+    """
+    Devuelve (info_global, lista_de_cuentas).
+    Cada cuenta: {"nro", "cbu", "moneda", "lineas"}
+    """
+    data = io.BytesIO(pdf_file.read())
+    with pdfplumber.open(data) as pdf:
+        lineas_raw = []
+        for page in pdf.pages:
+            lineas_raw.extend((page.extract_text() or "").splitlines())
 
-        math_success = False
-        if saldo_anterior is not None and saldo is not None:
-            dif = round(saldo - saldo_anterior, 2)
-            if dif > 0 and abs(dif) == round(importe_abs, 2):
-                credito = importe_abs
-                math_success = True
-            elif dif < 0 and abs(dif) == round(importe_abs, 2):
-                debito = importe_abs
-                math_success = True
+    info_global = extraer_info_global(lineas_raw)
 
-        if not math_success:
-            if "rescate" in desc_l: credito = importe_abs
-            elif "suscripcion" in desc_l or "suscripción" in desc_l: debito = importe_abs
-            else:
-                raw_clean = raw_importe.strip()
-                es_negativo = (importe < 0 or raw_clean.startswith("-") or (raw_clean.startswith("(") and raw_clean.endswith(")")))
-                if es_negativo: debito = importe_abs
-                else: credito = importe_abs
-    elif len(vals) == 1:
-        saldo = vals[0][0]
-    return debito, credito, saldo
+    cuentas = {}
+    orden = []
+    cuenta_act = None
+    capturando = False
 
-def procesar_lineas_movimientos(lineas):
+    for l in lineas_raw:
+        ls = l.strip()
+        ll = ls.lower()
+
+        # Parar en secciones no contables
+        if any(sw in ll for sw in STOP_PALABRAS):
+            capturando = False
+            cuenta_act = None
+            continue
+
+        # Nuevo encabezado de cuenta
+        m = RE_CBU.search(ls)
+        if m and "Fecha" not in ls:
+            nro = m.group(1)
+            cbu = m.group(2)
+            # Detectar moneda por el contexto cercano (U$S o no)
+            moneda = "U$S" if "U$S" in ls or "dólares" in ll else "$"
+            cuenta_act = nro
+            capturando = True
+            if nro not in cuentas:
+                cuentas[nro] = {"nro": nro, "cbu": cbu, "moneda": moneda, "lineas": []}
+                orden.append(nro)
+            continue
+
+        if not capturando or not cuenta_act:
+            continue
+
+        # Filtros de ruido
+        if (RE_PAG.match(ls)
+                or ("Fecha" in ls and "Comprobante" in ls)
+                or ls.lower().startswith("* salvo")
+                or re.match(r"^total\s*(u\$s|\$|$)", ll)
+                or not ls):
+            if re.match(r"^total\s*(u\$s|\$|$)", ll):
+                capturando = False
+                cuenta_act = None
+            continue
+
+        cuentas[cuenta_act]["lineas"].append(ls)
+
+    return info_global, [cuentas[n] for n in orden]
+
+
+# ── Parser de movimientos ─────────────────────────────────────────────────────
+def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
+    """
+    Convierte lineas de texto a lista de movimientos.
+    Usa validación matemática (saldo anterior ± importe = saldo posterior)
+    para determinar débito vs crédito sin depender del nombre del movimiento.
+    """
+    RE_M = RE_MONTO_AR if moneda == "$" else RE_MONTO_USD
     movimientos = []
-    saldo_actual = None
-    idx_start = 0
-    fecha_corriente = ""
+    saldo_actual: float | None = None
+    fecha_corr = ""
+    i = 0
 
-    # 1. Atrapar el Saldo Inicial y su monto exacto
-    idx_saldo = -1
-    for i, l in enumerate(lineas):
-        if "saldo inicial" in l.lower() or "saldo en cuenta" in l.lower():
-            idx_saldo = i
+    # ── Saldo inicial ────────────────────────────────────────────────────────
+    for j, l in enumerate(lineas):
+        if "saldo inicial" in l.lower():
+            ms = RE_M.findall(l)
+            if ms:
+                saldo_actual = parse_monto(ms[-1])
+                mf = RE_FECHA.search(l)
+                fecha_inicial = mf.group(0) if mf else ""
+                movimientos.append({
+                    "fecha": fecha_inicial,
+                    "comprobante": "",
+                    "descripcion": "Saldo Inicial",
+                    "debito": None,
+                    "credito": None,
+                    "saldo": saldo_actual,
+                    "categoria": "Saldo Inicial",
+                    "sin_fecha": not bool(fecha_inicial),
+                })
+                fecha_corr = fecha_inicial
+                i = j + 1
             break
-            
-    if idx_saldo != -1:
-        fecha_inicial = ""
-        for l in lineas[max(0, idx_saldo-2) : idx_saldo+3]:
-            m_fecha = RE_FECHA.search(l)
-            if m_fecha:
-                fecha_inicial = m_fecha.group(0)
-                break
-                
-        for i in range(idx_saldo, min(len(lineas), idx_saldo+4)):
-            montos = RE_MONTO_STR.findall(lineas[i])
-            if montos:
-                saldo_actual = parse_monto(montos[-1])
-                idx_start = i + 1
-                break
-                
-        if saldo_actual is not None:
-            movimientos.append({
-                "fecha": fecha_inicial,
-                "comprobante": "",
-                "descripcion": "Saldo Inicial",
-                "debito": None,
-                "credito": None,
-                "saldo": saldo_actual,
-                "categoria": "Saldo Inicial",
-                "sin_fecha": not bool(fecha_inicial)
-            })
-            fecha_corriente = fecha_inicial
 
-    # 2. Procesar el resto de los Movimientos protegidos
-    i = idx_start
+    # ── Movimientos ──────────────────────────────────────────────────────────
     while i < len(lineas):
         l = lineas[i].strip()
-        if not l:
-            i += 1
-            continue
+        i += 1
 
-        l_lower = l.lower()
-        # Filtros de basura interna
-        if (re.match(r"^\d+\s*-\s*\d+$", l) or
-            ("fecha" in l_lower and "comprobante" in l_lower) or
-            ("cuenta corriente" in l_lower and "cbu" in l_lower) or
-            l.startswith("* Salvo") or
-            l_lower == "santander" or
-            "saldo inicial" in l_lower):
-            i += 1
+        if not l or RE_PAG.match(l):
             continue
+        if "no tenés movimientos" in l.lower():
+            continue
+        if re.match(r"^total\b", l.lower()):
+            break
 
         if RE_FECHA.match(l):
-            fecha_corriente = l
-            i += 1
+            fecha_corr = l
             continue
 
-        montos_encontrados = RE_MONTO_STR.findall(l)
-        if not montos_encontrados:
-            if movimientos and movimientos[-1]["categoria"] != "Saldo Inicial" and not RE_FECHA.match(l):
+        montos_raw = RE_M.findall(l)
+        if not montos_raw:
+            # Línea de beneficiario/referencia → agregar al movimiento anterior
+            if movimientos and movimientos[-1]["categoria"] != "Saldo Inicial":
                 movimientos[-1]["descripcion"] += " | " + l
                 movimientos[-1]["categoria"] = categorizar(movimientos[-1]["descripcion"])
-            i += 1
             continue
 
-        sin_montos = RE_MONTO_STR.sub("", l).strip()
-        tokens     = sin_montos.split()
+        # ── Línea con montos ─────────────────────────────────────────────────
+        sin_m = RE_M.sub("", l).strip()
+        tokens = sin_m.split()
         fecha = comp = ""
         desc_t = []
-
         for t in tokens:
-            if not fecha and RE_FECHA.match(t): fecha = t
-            elif not comp and RE_COMP.match(t): comp = t
-            else: desc_t.append(t)
+            if not fecha and RE_FECHA.match(t):
+                fecha = t
+            elif not comp and RE_COMP.match(t):
+                comp = t
+            else:
+                desc_t.append(t)
 
-        if not fecha: fecha = fecha_corriente
+        if not fecha:
+            fecha = fecha_corr
         desc = " ".join(desc_t).strip()
 
-        if i + 1 < len(lineas):
-            sig = lineas[i + 1].strip()
-            sig_lower = sig.lower()
-            if (sig and not RE_MONTO_STR.findall(sig) and
-                not RE_FECHA.match(sig) and
-                not re.match(r"^\d+\s*-\s*\d+$", sig)):
+        # Capturar línea siguiente si es texto sin montos
+        if i < len(lineas):
+            sig = lineas[i].strip()
+            if (sig
+                    and not RE_M.findall(sig)
+                    and not RE_FECHA.match(sig)
+                    and not RE_PAG.match(sig)
+                    and not re.match(r"^total\b", sig.lower())):
                 desc = (desc + " | " + sig) if desc else sig
                 i += 1
 
-        debito, credito, saldo = _parsear_importes(montos_encontrados, desc, saldo_actual)
-        if saldo is not None: saldo_actual = saldo
+        vals = [parse_monto(m) for m in montos_raw]
+        vals = [v for v in vals if v is not None]
+
+        debito = credito = saldo = None
+
+        if len(vals) >= 2:
+            importe  = vals[-2]
+            saldo    = vals[-1]
+            abs_imp  = abs(importe)
+
+            # ── Validación matemática (método principal) ─────────────────────
+            clasificado = False
+            if saldo_actual is not None:
+                dif = round(saldo - saldo_actual, 2)
+                if abs(abs(dif) - round(abs_imp, 2)) < 0.02:
+                    if dif > 0:
+                        credito = abs_imp
+                    else:
+                        debito = abs_imp
+                    clasificado = True
+
+            # ── Fallback: keywords + signo ────────────────────────────────────
+            if not clasificado:
+                desc_l = desc.lower()
+                if "rescate" in desc_l:
+                    credito = abs_imp
+                elif "suscripcion" in desc_l or "suscripción" in desc_l:
+                    debito = abs_imp
+                elif importe < 0:
+                    debito = abs_imp
+                else:
+                    # En CC Santander la mayoría de movimientos sin signo son débitos
+                    # excepto los que tienen "credito", "recibida", "credi" en descripción
+                    if any(kw in desc_l for kw in ("recibida", "credi transf", "crédito transf",
+                                                    "credito transf", "rescate", "liquidacion titulos publicos credi")):
+                        credito = abs_imp
+                    else:
+                        debito = abs_imp
+
+        elif vals:
+            saldo = vals[0]
+
+        if saldo is not None:
+            saldo_actual = saldo
 
         movimientos.append({
-            "fecha": fecha, "comprobante": comp, "descripcion": desc,
-            "debito": debito, "credito": credito, "saldo": saldo,
-            "categoria": categorizar(desc), "sin_fecha": fecha == "",
+            "fecha": fecha,
+            "comprobante": comp,
+            "descripcion": desc,
+            "debito": debito,
+            "credito": credito,
+            "saldo": saldo,
+            "categoria": categorizar(desc),
+            "sin_fecha": fecha == "",
         })
-        i += 1
+
     return movimientos
 
-def extraer_pdf_multicuenta(pdf_file):
-    with pdfplumber.open(pdf_file) as pdf:
-        todas = []
-        for page in pdf.pages:
-            todas.extend((page.extract_text() or "").splitlines())
 
-    info_global = {"cuit": "", "desde": "", "hasta": "", "razon_social": ""}
-    cuentas = {}
-    cuenta_actual = None
-    leyendo_movimientos = False  # El "Candado"
+# ── Creación del Excel en memoria ─────────────────────────────────────────────
+def hdr(cell, bg=C_HEADER_BG, fg=C_HEADER_FG, bold=True, sz=10):
+    cell.font      = Font(name="Arial", bold=bold, color=fg, size=sz)
+    cell.fill      = PatternFill("solid", fgColor=bg)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    cell.border    = BRD
 
-    for l in todas:
-        l_strip = l.strip()
-        l_lower = l_strip.lower()
 
-        # Freno de mano absoluto para la sección final del PDF
-        if "detalle impositivo" in l_lower or "legales" in l_lower or "intercambio de información" in l_lower:
-            break
-
-        # Info Global
-        if not info_global["cuit"]:
-            m = re.search(r"CUIT[:\s]+([\d\-]+)", l_strip)
-            if m: info_global["cuit"] = m.group(1)
-        if not info_global["desde"]:
-            m = re.search(r"Desde:\s*(\d{2}/\d{2}/\d{2})", l_strip)
-            if m: info_global["desde"] = m.group(1)
-        if not info_global["hasta"]:
-            m = re.search(r"Hasta:\s*(\d{2}/\d{2}/\d{2})", l_strip)
-            if m: info_global["hasta"] = m.group(1)
-        if not info_global["razon_social"] and info_global["cuit"]:
-            if (re.match(r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s\.\-&,]+$", l_strip)
-                    and 4 < len(l_strip) < 60
-                    and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA")):
-                info_global["razon_social"] = l_strip
-
-        # 1. Detectar un CBU nuevo (Abre el candado)
-        m_cta = re.search(r"N[°ºoO]?\s*([\d\-/]+)\s+CBU:\s*(\d+)", l_strip)
-        if m_cta:
-            cta = m_cta.group(1)
-            cbu = m_cta.group(2)
-            cuenta_actual = cta
-            leyendo_movimientos = True # Se abre el candado para esta cuenta
-            if cta not in cuentas:
-                cuentas[cta] = {"nro_cuenta": cta, "cbu": cbu, "lineas": []}
-            continue
-
-        # 2. Si el candado está abierto, verificamos si hay que cerrarlo
-        if cuenta_actual and leyendo_movimientos:
-            # Si leemos "Total", "Saldo total" o "No tenés movimientos", CERRAR CANDADO
-            es_fin_tabla = (
-                re.match(r"^total\s*(?:u\$s|us\$|uss|\$)?\s*[\d.,]*$", l_lower) or
-                re.match(r"^saldo total\s*(?:u\$s|us\$|uss|\$)?\s*[\d.,]*$", l_lower) or
-                "no tenés movimientos" in l_lower or
-                "no tenes movimientos" in l_lower
-            )
-            
-            if es_fin_tabla:
-                leyendo_movimientos = False
-                continue # Ignoramos esta línea y las siguientes hasta el próximo CBU
-            
-            # Si no se cerró, es un movimiento real, lo guardamos
-            cuentas[cuenta_actual]["lineas"].append(l_strip)
-
-    resultados = []
-    for cta, datos in cuentas.items():
-        movimientos = procesar_lineas_movimientos(datos["lineas"])
-        
-        info_completa = {
-            **info_global,
-            "nro_cuenta": datos["nro_cuenta"],
-            "cbu": datos["cbu"]
-        }
-        
-        # Ignorar cuentas que solo trajeron la info del Saldo Inicial pero ningún movimiento real
-        movs_reales = [m for m in movimientos if "saldo inicial" not in m["descripcion"].lower()]
-        if movs_reales:
-            resultados.append({"info": info_completa, "movimientos": movimientos})
-
-    return resultados
-
-# ── Creación del Excel en Memoria ───────────────────────────────────────────
-def crear_excel_buffer(info, movimientos):
+def crear_excel(info: dict, movimientos: list[dict], moneda: str = "$") -> bytes:
     wb = Workbook()
     ws = wb.active
-    ws.title = "Movimientos"
+    ws.title        = "Movimientos"
     ws.freeze_panes = "A5"
 
+    simbolo = "$" if moneda == "$" else "U$S"
+
+    # Encabezado
     ws.merge_cells("A1:H1")
-    ws["A1"].value = f"Resumen de Cuenta — {info.get('razon_social', '')}  |  {info.get('desde', '')} al {info.get('hasta', '')}"
+    ws["A1"].value = (
+        f"Resumen  {info.get('razon_social', '')}  ·  "
+        f"{info.get('desde', '')} al {info.get('hasta', '')}"
+    )
     hdr(ws["A1"], sz=12)
     ws.row_dimensions[1].height = 22
 
     ws.merge_cells("A2:H2")
     s = ws["A2"]
-    s.value = f"Cta N° {info.get('nro_cuenta', '')}  |  CBU: {info.get('cbu', '')}  |  CUIT: {info.get('cuit', '')}"
-    s.font, s.fill, s.alignment, s.border = Font(name="Arial", size=9, color="555555"), PatternFill("solid", fgColor=C_SUBHEADER), Alignment(horizontal="center"), BRD
+    s.value = (
+        f"Cta Nº {info.get('nro_cuenta', '')}  ·  "
+        f"CBU: {info.get('cbu', '')}  ·  CUIT: {info.get('cuit', '')}"
+    )
+    s.font      = Font(name="Arial", size=9, color="555555")
+    s.fill      = PatternFill("solid", fgColor=C_SUBHEADER)
+    s.alignment = Alignment(horizontal="center")
+    s.border    = BRD
     ws.row_dimensions[2].height = 14
-    ws.row_dimensions[3].height = 6
+    ws.row_dimensions[3].height = 4
 
-    for c, h in enumerate(["Fecha", "Comprobante", "Descripción", "Categoría", "Débito", "Crédito", "Saldo", ""], 1):
+    # Encabezado de columnas
+    cols_hdr = ["Fecha", "Comprobante", "Descripción", "Categoría",
+                f"Débito ({simbolo})", f"Crédito ({simbolo})", f"Saldo ({simbolo})", ""]
+    for c, h in enumerate(cols_hdr, 1):
         cell = ws.cell(row=4, column=c, value=h)
         hdr(cell, bg="8B0000" if c in (5, 6, 7) else C_HEADER_BG)
-    for i, w in enumerate([10, 12, 48, 22, 14, 14, 14, 2], 1): ws.column_dimensions[get_column_letter(i)].width = w
+    ws.row_dimensions[4].height = 16
 
+    for idx, w in enumerate([10, 12, 50, 22, 15, 15, 15, 2], 1):
+        ws.column_dimensions[get_column_letter(idx)].width = w
+
+    num_fmt = '#,##0.00;[Red](#,##0.00);-'
+
+    # Filas de movimientos
     fila = 5
     for mov in movimientos:
         bg = "FFFFFF"
-        if mov.get("sin_fecha"): bg = C_WARN
-        elif mov["categoria"] == "Saldo Inicial": bg = C_TOTAL_BG
-        elif mov["debito"] and not mov["credito"]: bg = C_DEBITO
-        elif mov["credito"] and not mov["debito"]: bg = C_CREDITO
-        
-        if mov["categoria"] in ("Imp. débitos/créditos", "IVA", "IIBB"): bg = C_IMPUESTO
+        cat = mov["categoria"]
+        if cat == "Saldo Inicial":
+            bg = C_SALDO_INIT
+        elif mov.get("sin_fecha"):
+            bg = "FFF3CD"
+        elif mov["debito"] and not mov["credito"]:
+            bg = C_DEBITO
+        elif mov["credito"] and not mov["debito"]:
+            bg = C_CREDITO
+        if cat in ("Imp. débitos/créditos", "IVA", "IIBB"):
+            bg = C_IMPUESTO
 
-        for c, v in enumerate([mov["fecha"], mov["comprobante"], mov["descripcion"], mov["categoria"], mov["debito"], mov["credito"], mov["saldo"]], 1):
-            cell = ws.cell(row=fila, column=c, value=v)
-            cell.font, cell.fill, cell.border = Font(name="Arial", size=9), PatternFill("solid", fgColor=bg), BRD
+        valores = [
+            mov["fecha"], mov["comprobante"], mov["descripcion"], cat,
+            mov["debito"], mov["credito"], mov["saldo"],
+        ]
+        for c, v in enumerate(valores, 1):
+            cell        = ws.cell(row=fila, column=c, value=v)
+            cell.font   = Font(name="Arial", size=9)
+            cell.fill   = PatternFill("solid", fgColor=bg)
+            cell.border = BRD
             if c in (5, 6, 7) and v is not None:
-                cell.number_format, cell.alignment = '#,##0.00;[Red](#,##0.00);-', Alignment(horizontal="right")
+                cell.number_format = num_fmt
+                cell.alignment     = Alignment(horizontal="right")
         fila += 1
 
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-    return buffer
+    # Fila de totales
+    for c in range(1, 9):
+        ws.cell(row=fila, column=c).fill   = PatternFill("solid", fgColor=C_TOTAL_BG)
+        ws.cell(row=fila, column=c).border = BRD
+    ws.cell(row=fila, column=4, value="TOTALES").font = Font(name="Arial", bold=True, size=9)
+    for c, col in [(5, "E"), (6, "F")]:
+        cell               = ws.cell(row=fila, column=c)
+        cell.value         = f"=SUM({col}5:{col}{fila - 1})"
+        cell.font          = Font(name="Arial", bold=True, size=9)
+        cell.number_format = num_fmt
+        cell.alignment     = Alignment(horizontal="right")
 
-# ── INTERFAZ WEB STREAMLIT ──────────────────────────────────────────────────
-st.set_page_config(page_title="Santander a Excel", page_icon="🏦", layout="centered")
+    # ── Hoja Por Categoría ────────────────────────────────────────────────────
+    ws2 = wb.create_sheet("Por Categoría")
+    for idx, w in enumerate([28, 16, 16, 8], 1):
+        ws2.column_dimensions[get_column_letter(idx)].width = w
+    ws2.merge_cells("A1:D1")
+    ws2["A1"].value = "Resumen por Categoría"
+    hdr(ws2["A1"], sz=11)
+    for c, h in enumerate(["Categoría", f"Débitos ({simbolo})", f"Créditos ({simbolo})", "Movs."], 1):
+        hdr(ws2.cell(row=2, column=c, value=h))
 
-if "archivos_procesados" not in st.session_state:
-    st.session_state.archivos_procesados = {}
+    cats: dict = {}
+    for m in movimientos:
+        if m["categoria"] == "Saldo Inicial":
+            continue
+        cats.setdefault(m["categoria"], {"d": 0.0, "c": 0.0, "n": 0})
+        cats[m["categoria"]]["d"] += m["debito"]  or 0
+        cats[m["categoria"]]["c"] += m["credito"] or 0
+        cats[m["categoria"]]["n"] += 1
 
-st.title("🏦 Conversor Santander a Excel")
-st.write("Subí tus extractos en PDF. Te generaremos un Excel por cada cuenta que tenga movimientos.")
+    r = 3
+    for cat, v in sorted(cats.items()):
+        ws2.cell(row=r, column=1, value=cat).font   = Font(name="Arial", size=9)
+        ws2.cell(row=r, column=1).border            = BRD
+        for c, k in [(2, "d"), (3, "c"), (4, "n")]:
+            cell               = ws2.cell(row=r, column=c, value=v[k])
+            cell.font          = Font(name="Arial", size=9)
+            cell.alignment     = Alignment(horizontal="right")
+            cell.border        = BRD
+            if c in (2, 3):
+                cell.number_format = num_fmt
+        r += 1
 
-uploaded_files = st.file_uploader("Arrastrá los PDF acá", type=["pdf"], accept_multiple_files=True)
+    # ── Hoja Info ─────────────────────────────────────────────────────────────
+    ws3 = wb.create_sheet("Info")
+    ws3.column_dimensions["A"].width = 22
+    ws3.column_dimensions["B"].width = 40
+    ws3.merge_cells("A1:B1")
+    ws3["A1"].value = "Datos del Extracto"
+    hdr(ws3["A1"])
+
+    saldo_final = movimientos[-1]["saldo"] if movimientos else ""
+    campos = [
+        ("Razón Social",  info.get("razon_social", "")),
+        ("CUIT",          info.get("cuit", "")),
+        ("N° Cuenta",     info.get("nro_cuenta", "")),
+        ("CBU",           info.get("cbu", "")),
+        ("Moneda",        moneda),
+        ("Período Desde", info.get("desde", "")),
+        ("Período Hasta", info.get("hasta", "")),
+        ("Saldo Inicial", movimientos[0]["saldo"] if movimientos else ""),
+        ("Saldo Final",   saldo_final),
+        ("Total Movim.",  len(movimientos) - 1),   # excluir saldo inicial
+        ("Generado",      datetime.now().strftime("%d/%m/%Y %H:%M")),
+    ]
+    for idx, (k, v) in enumerate(campos, 2):
+        ws3.cell(row=idx, column=1, value=k).font = Font(name="Arial", bold=True, size=9)
+        cell      = ws3.cell(row=idx, column=2, value=v)
+        cell.font = Font(name="Arial", size=9)
+        if k in ("Saldo Inicial", "Saldo Final") and isinstance(v, float):
+            cell.number_format = num_fmt
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ── Procesamiento completo de un PDF ──────────────────────────────────────────
+def procesar_pdf(pdf_file) -> list[dict]:
+    """
+    Retorna lista de resultados, uno por cuenta con movimientos.
+    Cada resultado: {"info": {...}, "movimientos": [...], "moneda": "..."}
+    """
+    info_global, cuentas = extraer_cuentas_del_pdf(pdf_file)
+    resultados = []
+
+    for cta in cuentas:
+        movimientos = procesar_lineas(cta["lineas"], cta["moneda"])
+        movs_reales = [m for m in movimientos if m["categoria"] != "Saldo Inicial"]
+        if not movs_reales:
+            continue
+
+        info_cta = {
+            **info_global,
+            "nro_cuenta": cta["nro"],
+            "cbu":        cta["cbu"],
+        }
+        resultados.append({
+            "info":        info_cta,
+            "movimientos": movimientos,
+            "moneda":      cta["moneda"],
+        })
+
+    return resultados
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI Streamlit
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.set_page_config(
+    page_title="Santander → Excel",
+    page_icon="🏦",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+# ── CSS personalizado ─────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'IBM Plex Sans', sans-serif;
+}
+
+/* Fondo general */
+.stApp {
+    background: #f8f6f2;
+}
+
+/* Ocultar elementos default de Streamlit */
+#MainMenu, footer, header { visibility: hidden; }
+.block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 780px; }
+
+/* Header personalizado */
+.app-header {
+    background: #CC0000;
+    border-radius: 12px;
+    padding: 28px 32px 22px;
+    margin-bottom: 28px;
+    position: relative;
+    overflow: hidden;
+}
+.app-header::before {
+    content: '';
+    position: absolute;
+    top: -40px; right: -40px;
+    width: 160px; height: 160px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 50%;
+}
+.app-header::after {
+    content: '';
+    position: absolute;
+    bottom: -20px; right: 60px;
+    width: 80px; height: 80px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 50%;
+}
+.app-header h1 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.6rem;
+    font-weight: 600;
+    color: #fff;
+    margin: 0 0 4px;
+    letter-spacing: -0.5px;
+}
+.app-header p {
+    font-size: 0.85rem;
+    color: rgba(255,255,255,0.72);
+    margin: 0;
+    font-weight: 300;
+}
+
+/* Zona de upload */
+.upload-zone {
+    background: #fff;
+    border: 2px dashed #ddd;
+    border-radius: 12px;
+    padding: 8px 16px 16px;
+    margin-bottom: 16px;
+    transition: border-color 0.2s;
+}
+.upload-zone:hover { border-color: #CC0000; }
+
+/* Tarjeta de resultado */
+.result-card {
+    background: #fff;
+    border-radius: 12px;
+    border: 1px solid #e8e4df;
+    padding: 20px 24px;
+    margin-bottom: 14px;
+    position: relative;
+}
+.result-card-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+.result-badge {
+    background: #CC0000;
+    color: #fff;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 20px;
+    letter-spacing: 0.5px;
+}
+.result-badge-usd {
+    background: #1a5276;
+}
+.result-account {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: #1a1a1a;
+    margin-bottom: 2px;
+}
+.result-meta {
+    font-size: 0.78rem;
+    color: #888;
+}
+.stat-row {
+    display: flex;
+    gap: 16px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid #f0ece8;
+}
+.stat-item { flex: 1; }
+.stat-label {
+    font-size: 0.7rem;
+    color: #aaa;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 2px;
+}
+.stat-value {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: #1a1a1a;
+}
+.stat-value.red { color: #CC0000; }
+.stat-value.green { color: #1e7e34; }
+
+/* Botón de descarga */
+.stDownloadButton button {
+    background: #CC0000 !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.85rem !important;
+    padding: 8px 20px !important;
+    width: 100% !important;
+    margin-top: 10px !important;
+    transition: background 0.15s !important;
+}
+.stDownloadButton button:hover {
+    background: #a80000 !important;
+}
+
+/* Botón procesar */
+.stButton button {
+    background: #1a1a1a !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 8px !important;
+    font-family: 'IBM Plex Sans', sans-serif !important;
+    font-weight: 500 !important;
+    font-size: 0.9rem !important;
+    padding: 10px 28px !important;
+    width: 100% !important;
+    transition: background 0.15s !important;
+}
+.stButton button:hover { background: #333 !important; }
+
+/* Alertas */
+.stAlert { border-radius: 8px !important; }
+
+/* Spinner */
+.stSpinner > div { border-top-color: #CC0000 !important; }
+
+/* File uploader */
+[data-testid="stFileUploader"] {
+    background: transparent !important;
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+    color: #555 !important;
+    background: #f8f6f2 !important;
+    border-radius: 8px !important;
+}
+
+/* Legend */
+.legend-row {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-top: 6px;
+    font-size: 0.75rem;
+    color: #666;
+}
+.legend-dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 2px;
+    margin-right: 4px;
+    vertical-align: middle;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Header ────────────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="app-header">
+    <h1>Santander → Excel</h1>
+    <p>Convertí extractos PDF a planillas Excel · Multicuenta · Validación matemática de saldos</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Estado de sesión ──────────────────────────────────────────────────────────
+if "resultados_por_archivo" not in st.session_state:
+    st.session_state.resultados_por_archivo = {}
+
+# ── Upload ────────────────────────────────────────────────────────────────────
+st.markdown('<div class="upload-zone">', unsafe_allow_html=True)
+uploaded_files = st.file_uploader(
+    "Arrastrá uno o más extractos PDF",
+    type=["pdf"],
+    accept_multiple_files=True,
+    label_visibility="visible",
+)
+st.markdown("</div>", unsafe_allow_html=True)
+
+if not uploaded_files:
+    st.session_state.resultados_por_archivo = {}
+    st.markdown("""
+    <div style="text-align:center;padding:32px 0 16px;color:#aaa;font-size:0.82rem;">
+        Subí el PDF del resumen mensual de Santander.<br>
+        Soporta múltiples cuentas dentro del mismo archivo.
+    </div>
+    """, unsafe_allow_html=True)
 
 if uploaded_files:
-    if st.button("Procesar Archivos", type="primary"):
-        st.session_state.archivos_procesados = {}
-        
-        for file in uploaded_files:
-            with st.spinner(f"Escaneando {file.name}..."):
-                try:
-                    resultados = extraer_pdf_multicuenta(file)
-                    if resultados:
-                        st.success(f"✅ {file.name} escaneado: ¡Se detectaron {len(resultados)} cuenta(s) con movimientos!")
-                        
-                        buffers_descarga = []
-                        for res in resultados:
-                            info = res["info"]
-                            movs = res["movimientos"]
-                            excel_buffer = crear_excel_buffer(info, movs)
-                            cuenta_limpia = info['nro_cuenta'].replace('/', '-')
-                            
-                            buffers_descarga.append({
-                                "nombre_archivo": f"Cta_{cuenta_limpia}_{file.name.replace('.pdf', '')}.xlsx",
-                                "buffer": excel_buffer,
-                                "titulo_boton": f"📥 Descargar Cuenta {info['nro_cuenta']} ({len(movs)-1} movs)"
-                            })
-                        
-                        st.session_state.archivos_procesados[file.name] = buffers_descarga
-                    else:
-                        st.warning(f"⚠️ No se detectaron movimientos en {file.name}.")
-                except Exception as e:
-                    st.error(f"❌ Ocurrió un error al procesar {file.name}: {str(e)}")
+    if st.button("⚙  Procesar archivos", use_container_width=True):
+        st.session_state.resultados_por_archivo = {}
+        progress = st.progress(0, text="Iniciando…")
 
+        for idx_f, file in enumerate(uploaded_files):
+            progress.progress(
+                (idx_f) / len(uploaded_files),
+                text=f"Procesando {file.name}…"
+            )
+            try:
+                resultados = procesar_pdf(file)
+                if resultados:
+                    # Generar bytes de Excel para cada cuenta
+                    for res in resultados:
+                        res["excel_bytes"] = crear_excel(
+                            res["info"], res["movimientos"], res["moneda"]
+                        )
+                    st.session_state.resultados_por_archivo[file.name] = {
+                        "ok": True,
+                        "resultados": resultados,
+                    }
+                else:
+                    st.session_state.resultados_por_archivo[file.name] = {
+                        "ok": False,
+                        "msg": "No se detectaron cuentas con movimientos.",
+                    }
+            except Exception as e:
+                st.session_state.resultados_por_archivo[file.name] = {
+                    "ok": False,
+                    "msg": str(e),
+                }
+
+        progress.progress(1.0, text="¡Listo!")
+
+    # ── Resultados ────────────────────────────────────────────────────────────
     for file in uploaded_files:
-        if file.name in st.session_state.archivos_procesados:
-            st.markdown(f"**Descargas listas para: {file.name}**")
-            for i, data_boton in enumerate(st.session_state.archivos_procesados[file.name]):
-                st.download_button(
-                    label=data_boton["titulo_boton"],
-                    data=data_boton["buffer"],
-                    file_name=data_boton["nombre_archivo"],
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{file.name}_{i}"
-                )
-else:
-    st.session_state.archivos_procesados = {}
+        nombre = file.name
+        if nombre not in st.session_state.resultados_por_archivo:
+            continue
+
+        datos = st.session_state.resultados_por_archivo[nombre]
+
+        if not datos["ok"]:
+            st.warning(f"**{nombre}** — {datos['msg']}")
+            continue
+
+        resultados = datos["resultados"]
+        st.markdown(
+            f"<div style='font-size:0.72rem;color:#aaa;margin:18px 0 8px;"
+            f"font-family:IBM Plex Mono,monospace;letter-spacing:.5px'>"
+            f"ARCHIVO · {nombre} · {len(resultados)} cuenta(s) detectada(s)"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        for res in resultados:
+            info   = res["info"]
+            movs   = res["movimientos"]
+            moneda = res["moneda"]
+
+            # Calcular estadísticas
+            movs_reales = [m for m in movs if m["categoria"] != "Saldo Inicial"]
+            total_deb   = sum(m["debito"]  or 0 for m in movs_reales)
+            total_cred  = sum(m["credito"] or 0 for m in movs_reales)
+            saldo_ini   = movs[0]["saldo"] if movs and movs[0]["categoria"] == "Saldo Inicial" else None
+            saldo_fin   = movs[-1]["saldo"] if movs else None
+
+            sim         = moneda
+            badge_cls   = "result-badge-usd" if moneda == "U$S" else "result-badge"
+            nro_display = info.get("nro_cuenta", "—")
+            cbu_display = info.get("cbu", "—")
+
+            def fmt_num(v):
+                if v is None: return "—"
+                return f"{sim} {v:,.2f}"
+
+            st.markdown(f"""
+            <div class="result-card">
+                <div class="result-card-header">
+                    <div>
+                        <div class="result-account">Cta Nº {nro_display}</div>
+                        <div class="result-meta">CBU: {cbu_display}</div>
+                    </div>
+                    <span class="{badge_cls}">{moneda}</span>
+                </div>
+                <div class="stat-row">
+                    <div class="stat-item">
+                        <div class="stat-label">Movimientos</div>
+                        <div class="stat-value">{len(movs_reales)}</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Total débitos</div>
+                        <div class="stat-value red">{fmt_num(total_deb)}</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Total créditos</div>
+                        <div class="stat-value green">{fmt_num(total_cred)}</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Saldo final</div>
+                        <div class="stat-value">{fmt_num(saldo_fin)}</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Nombre del archivo Excel
+            periodo = f"{info.get('desde','').replace('/','')}-{info.get('hasta','').replace('/','')}"
+            nro_safe = nro_display.replace("/", "-")
+            nombre_xlsx = f"Cta_{nro_safe}_{periodo}.xlsx"
+
+            st.download_button(
+                label=f"⬇  Descargar {nombre_xlsx}",
+                data=res["excel_bytes"],
+                file_name=nombre_xlsx,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_{nombre}_{nro_display}",
+                use_container_width=True,
+            )
+
+    # ── Leyenda de colores ────────────────────────────────────────────────────
+    if any(d["ok"] for d in st.session_state.resultados_por_archivo.values()):
+        with st.expander("📋  Leyenda de colores del Excel"):
+            st.markdown("""
+            <div class="legend-row">
+                <span><span class="legend-dot" style="background:#FFF0F0"></span>Débito</span>
+                <span><span class="legend-dot" style="background:#F0FFF0"></span>Crédito</span>
+                <span><span class="legend-dot" style="background:#FFF8E1"></span>Imp. débitos/créditos · IVA · IIBB</span>
+                <span><span class="legend-dot" style="background:#EEF2FF"></span>Saldo inicial</span>
+                <span><span class="legend-dot" style="background:#FFF3CD"></span>Sin fecha detectada</span>
+            </div>
+            """, unsafe_allow_html=True)
+
