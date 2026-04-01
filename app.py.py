@@ -29,6 +29,7 @@ def hdr(cell, bg=C_HEADER_BG, fg=C_HEADER_FG, bold=True, sz=10):
 # ── Helpers ─────────────────────────────────────────────────────────────────
 def categorizar(d):
     d = d.lower()
+    if "saldo inicial" in d:                           return "Saldo Inicial"
     if "haberes" in d or "sueldo" in d:                return "Sueldos y haberes"
     if "honorario" in d or "/ hon" in d:               return "Honorarios"
     if "alquiler" in d or "/ alq" in d:                return "Alquileres"
@@ -48,14 +49,12 @@ def categorizar(d):
     return "Otros"
 
 # ── Lógica de Extracción ────────────────────────────────────────────────────
-# Ahora soporta U$S, US$ y $
 RE_MONTO_STR = re.compile(r"-?\(?(?:U\$S|US\$|\$)?\s*[\d.]+,\d{2}\)?")
 RE_FECHA     = re.compile(r"^\d{2}/\d{2}/\d{2}$")
 RE_COMP      = re.compile(r"^\d{5,9}$")
 
 def parse_monto(s):
     if s is None: return None
-    # Limpiamos letras y simbolos (incluyendo U$S)
     s = re.sub(r"[^\d.,\-()]", "", str(s)).strip()
     if not s: return None
     negativo = s.startswith("-") or (s.startswith("(") and s.endswith(")"))
@@ -115,7 +114,6 @@ def procesar_lineas_movimientos(lineas, saldo_inicial):
             i += 1
             continue
 
-        # Ignorar basuras de fin de tabla, paginacion o avisos de no movimientos
         if (re.match(r"^\d+\s*-\s*\d+$", l) or
             ("Fecha" in l and "Comprobante" in l) or
             ("Cuenta Corriente" in l and "CBU" in l) or
@@ -154,7 +152,6 @@ def procesar_lineas_movimientos(lineas, saldo_inicial):
 
         if i + 1 < len(lineas):
             sig = lineas[i + 1].strip()
-            # Si la linea siguiente no tiene montos ni fecha ni palabras reservadas, la pegamos a la descripcion
             if (sig and not RE_MONTO_STR.findall(sig) and
                 not RE_FECHA.match(sig) and
                 not sig.lower().startswith("total") and
@@ -187,7 +184,6 @@ def extraer_pdf_multicuenta(pdf_file):
     for l in todas:
         l_strip = l.strip()
 
-        # 1. Info General
         if not info_global["cuit"]:
             m = re.search(r"CUIT[:\s]+([\d\-]+)", l_strip)
             if m: info_global["cuit"] = m.group(1)
@@ -203,12 +199,10 @@ def extraer_pdf_multicuenta(pdf_file):
                     and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA", "Detalle impositivo")):
                 info_global["razon_social"] = l_strip
 
-        # Frenar lectura de cuentas si entramos a la sección legal o impositiva
         if "Detalle impositivo" in l_strip or "Legales" in l_strip:
             cuenta_actual = None
             continue
 
-        # 2. Detectar cambio de cuenta (captura N°, Nº, etc.)
         m_cta = re.search(r"N[°ºoO]?\s*([\d\-/]+)\s+CBU:\s*(\d+)", l_strip)
         if m_cta:
             cta = m_cta.group(1)
@@ -223,17 +217,15 @@ def extraer_pdf_multicuenta(pdf_file):
                 }
             continue
 
-        # 3. Guardar las lineas dentro de la cuenta activa
         if cuenta_actual:
-            # Atrapar Saldo Inicial si aparece (soporta U$S o $)
-            m_saldo = re.search(r"Saldo Inicial\s+(?:U\$S|\$|US\$)?\s*([\d.,]+)", l_strip)
+            m_saldo = re.search(r"Saldo Inicial\s+(?:U\$S|\$|US\$)?\s*([\d.,]+)", l_strip, re.IGNORECASE)
             if m_saldo and cuentas[cuenta_actual]["saldo_inicial"] is None:
                 cuentas[cuenta_actual]["saldo_inicial"] = parse_monto(m_saldo.group(1))
-                continue 
+                # Acá borré el "continue" tramposo que desaparecía la fila
             
+            # Ahora la línea de Saldo Inicial SÍ se guarda para el Excel
             cuentas[cuenta_actual]["lineas"].append(l_strip)
 
-    # 4. Procesar lo que juntamos
     resultados = []
     for cta, datos in cuentas.items():
         movimientos = procesar_lineas_movimientos(datos["lineas"], datos["saldo_inicial"])
@@ -245,8 +237,11 @@ def extraer_pdf_multicuenta(pdf_file):
             "saldo_inicial": datos["saldo_inicial"]
         }
         
-        # Solo devolvemos la cuenta si realmente tuvo movimientos
-        if movimientos:
+        # Filtramos para asegurarnos de que no nos devuelva cuentas vacías 
+        # (Que tengan el saldo inicial como ÚNICA línea)
+        movs_reales = [m for m in movimientos if "saldo inicial" not in m["descripcion"].lower()]
+        
+        if movs_reales:
             resultados.append({"info": info_completa, "movimientos": movimientos})
 
     return resultados
@@ -277,7 +272,13 @@ def crear_excel_buffer(info, movimientos):
 
     fila = 5
     for mov in movimientos:
-        bg = C_WARN if mov.get("sin_fecha") else C_DEBITO if (mov["debito"] and not mov["credito"]) else C_CREDITO if (mov["credito"] and not mov["debito"]) else "FFFFFF"
+        # Coloreado dinámico
+        bg = "FFFFFF"
+        if mov.get("sin_fecha"): bg = C_WARN
+        elif mov["categoria"] == "Saldo Inicial": bg = C_TOTAL_BG # Gris para que destaque el saldo inicial
+        elif mov["debito"] and not mov["credito"]: bg = C_DEBITO
+        elif mov["credito"] and not mov["debito"]: bg = C_CREDITO
+        
         if mov["categoria"] in ("Imp. débitos/créditos", "IVA", "IIBB"): bg = C_IMPUESTO
 
         for c, v in enumerate([mov["fecha"], mov["comprobante"], mov["descripcion"], mov["categoria"], mov["debito"], mov["credito"], mov["saldo"]], 1):
@@ -319,7 +320,7 @@ if uploaded_files:
                             nombre_excel = f"Extracto_{cuenta_limpia}.xlsx"
                             
                             st.download_button(
-                                label=f"📥 Descargar Excel — Cuenta {info['nro_cuenta']} ({len(movs)} movs)",
+                                label=f"📥 Descargar Excel — Cuenta {info['nro_cuenta']} ({len(movs)-1} movs)",
                                 data=excel_buffer,
                                 file_name=nombre_excel,
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
