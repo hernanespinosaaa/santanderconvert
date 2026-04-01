@@ -108,7 +108,7 @@ def procesar_lineas_movimientos(lineas):
     idx_start = 0
     fecha_corriente = ""
 
-    # 1. Cacería intensiva del "Saldo Inicial" en las primeras líneas
+    # 1. Atrapar el Saldo Inicial
     idx_saldo = -1
     for i, l in enumerate(lineas):
         if "saldo inicial" in l.lower() or "saldo en cuenta" in l.lower():
@@ -117,22 +117,19 @@ def procesar_lineas_movimientos(lineas):
             
     if idx_saldo != -1:
         fecha_inicial = ""
-        # Buscar la fecha un renglón antes o después
         for l in lineas[max(0, idx_saldo-2) : idx_saldo+3]:
             m_fecha = RE_FECHA.search(l)
             if m_fecha:
                 fecha_inicial = m_fecha.group(0)
                 break
                 
-        # Buscar el monto de plata en el mismo renglón o los siguientes
         for i in range(idx_saldo, min(len(lineas), idx_saldo+4)):
             montos = RE_MONTO_STR.findall(lineas[i])
             if montos:
                 saldo_actual = parse_monto(montos[-1])
-                idx_start = i + 1  # Empezar a leer movimientos DESPUÉS de esto
+                idx_start = i + 1
                 break
                 
-        # Si encontramos cuánta plata había, armamos el movimiento manual
         if saldo_actual is not None:
             movimientos.append({
                 "fecha": fecha_inicial,
@@ -146,7 +143,7 @@ def procesar_lineas_movimientos(lineas):
             })
             fecha_corriente = fecha_inicial
 
-    # 2. Procesar el resto de los movimientos de forma normal
+    # 2. Procesar Movimientos
     i = idx_start
     while i < len(lineas):
         l = lineas[i].strip()
@@ -154,15 +151,15 @@ def procesar_lineas_movimientos(lineas):
             i += 1
             continue
 
-        # Esquivar basura de la tabla y encabezados repetidos
+        l_lower = l.lower()
         if (re.match(r"^\d+\s*-\s*\d+$", l) or
-            ("Fecha" in l and "Comprobante" in l) or
-            ("Cuenta Corriente" in l and "CBU" in l) or
+            ("fecha" in l_lower and "comprobante" in l_lower) or
+            ("cuenta corriente" in l_lower and "cbu" in l_lower) or
             l.startswith("* Salvo") or
-            l.lower().startswith("total") or
-            "No tenés movimientos" in l or
-            "saldo inicial" in l.lower() or
-            "saldo total" in l.lower()):
+            l_lower.startswith("total") or
+            "saldo total" in l_lower or
+            "no tenés movimientos" in l_lower or
+            "saldo inicial" in l_lower):
             i += 1
             continue
 
@@ -194,10 +191,11 @@ def procesar_lineas_movimientos(lineas):
 
         if i + 1 < len(lineas):
             sig = lineas[i + 1].strip()
+            sig_lower = sig.lower()
             if (sig and not RE_MONTO_STR.findall(sig) and
                 not RE_FECHA.match(sig) and
-                not sig.lower().startswith("total") and
-                not "saldo total" in sig.lower() and
+                not sig_lower.startswith("total") and
+                not "saldo total" in sig_lower and
                 not re.match(r"^\d+\s*-\s*\d+$", sig)):
                 desc = (desc + " | " + sig) if desc else sig
                 i += 1
@@ -226,6 +224,11 @@ def extraer_pdf_multicuenta(pdf_file):
     for l in todas:
         l_strip = l.strip()
 
+        # AQUÍ ESTÁ EL FRENO DE MANO QUE ARREGLA TODO:
+        # Si leemos esto, cortamos la extracción de raíz para que no mezcle datos.
+        if "detalle impositivo" in l_strip.lower() or "legales" in l_strip.lower():
+            break
+
         if not info_global["cuit"]:
             m = re.search(r"CUIT[:\s]+([\d\-]+)", l_strip)
             if m: info_global["cuit"] = m.group(1)
@@ -238,12 +241,8 @@ def extraer_pdf_multicuenta(pdf_file):
         if not info_global["razon_social"] and info_global["cuit"]:
             if (re.match(r"^[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ\s\.\-&,]+$", l_strip)
                     and 4 < len(l_strip) < 60
-                    and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA", "Detalle impositivo")):
+                    and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA")):
                 info_global["razon_social"] = l_strip
-
-        if "Detalle impositivo" in l_strip or "Legales" in l_strip:
-            cuenta_actual = None
-            continue
 
         m_cta = re.search(r"N[°ºoO]?\s*([\d\-/]+)\s+CBU:\s*(\d+)", l_strip)
         if m_cta:
@@ -267,7 +266,6 @@ def extraer_pdf_multicuenta(pdf_file):
             "cbu": datos["cbu"]
         }
         
-        # Ignorar cuentas que solo trajeron la info del Saldo Inicial pero ningún movimiento real
         movs_reales = [m for m in movimientos if "saldo inicial" not in m["descripcion"].lower()]
         if movs_reales:
             resultados.append({"info": info_completa, "movimientos": movimientos})
@@ -323,7 +321,6 @@ def crear_excel_buffer(info, movimientos):
 # ── INTERFAZ WEB STREAMLIT ──────────────────────────────────────────────────
 st.set_page_config(page_title="Santander a Excel", page_icon="🏦", layout="centered")
 
-# Inicializar la "memoria" de la página
 if "archivos_procesados" not in st.session_state:
     st.session_state.archivos_procesados = {}
 
@@ -334,7 +331,7 @@ uploaded_files = st.file_uploader("Arrastrá los PDF acá", type=["pdf"], accept
 
 if uploaded_files:
     if st.button("Procesar Archivos", type="primary"):
-        st.session_state.archivos_procesados = {} # Limpiamos la memoria vieja
+        st.session_state.archivos_procesados = {}
         
         for file in uploaded_files:
             with st.spinner(f"Escaneando {file.name}..."):
@@ -356,15 +353,12 @@ if uploaded_files:
                                 "titulo_boton": f"📥 Descargar Cuenta {info['nro_cuenta']} ({len(movs)-1} movs)"
                             })
                         
-                        # Guardamos los botones en la memoria de la página
                         st.session_state.archivos_procesados[file.name] = buffers_descarga
                     else:
                         st.warning(f"⚠️ No se detectaron movimientos en {file.name}.")
                 except Exception as e:
                     st.error(f"❌ Ocurrió un error al procesar {file.name}: {str(e)}")
 
-    # Mostramos los botones de descarga usando la información de la memoria
-    # ¡Así no se borran cuando hacés clic en uno!
     for file in uploaded_files:
         if file.name in st.session_state.archivos_procesados:
             st.markdown(f"**Descargas listas para: {file.name}**")
@@ -377,5 +371,4 @@ if uploaded_files:
                     key=f"dl_{file.name}_{i}"
                 )
 else:
-    # Si borrás los archivos del cuadro de subida, limpiamos la memoria
     st.session_state.archivos_procesados = {}
