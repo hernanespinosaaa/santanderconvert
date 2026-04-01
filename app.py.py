@@ -100,20 +100,8 @@ def _parsear_importes(montos_str, desc, saldo_anterior=None):
         saldo = vals[0][0]
     return debito, credito, saldo
 
-def procesar_lineas_movimientos(todas_las_lineas, saldo_inicial):
-    lineas = []
-    cap = False
-    for l in todas_las_lineas:
-        if "Movimientos en pesos" in l:
-            cap = True
-            continue
-        if cap and "Saldo total" in l: break
-        if not cap: continue
-        s = l.strip()
-        if not s or re.match(r"^\d+\s*-\s*\d+$", s) or ("Fecha" in s and "Comprobante" in s) or ("Cuenta Corriente" in s and "CBU" in s) or s.startswith("* Salvo"):
-            continue
-        lineas.append(s)
-
+def procesar_lineas_movimientos(lineas, saldo_inicial):
+    """Procesa un bloque de líneas que ya se sabe que son movimientos puros."""
     movimientos = []
     fecha_corriente = ""
     i = 0
@@ -170,10 +158,19 @@ def extraer_pdf_multicuenta(pdf_file):
         for page in pdf.pages:
             todas.extend((page.extract_text() or "").splitlines())
 
-    # 1. Info global del cliente
     info_global = {"cuit": "", "desde": "", "hasta": "", "razon_social": ""}
+    last_nro_cuenta = ""
+    last_cbu = ""
+    last_saldo_inicial = None
+    
+    bloques = []
+    bloque_actual = []
+    in_movimientos = False
+    
     for l in todas:
         l_strip = l.strip()
+        
+        # 1. Info General
         if not info_global["cuit"]:
             m = re.search(r"CUIT[:\s]+([\d\-]+)", l)
             if m: info_global["cuit"] = m.group(1)
@@ -189,39 +186,63 @@ def extraer_pdf_multicuenta(pdf_file):
                     and l_strip not in ("EXTRACTO DE CUENTA", "CUENTA CORRIENTE", "BANCO SANTANDER", "RESUMEN DE CUENTA")):
                 info_global["razon_social"] = l_strip
 
-    # 2. Separar lineas por cuenta
-    cuentas = {}
-    cuenta_actual = None
+        # 2. Info de la cuenta (se actualiza para guardar la última leída antes de los movimientos)
+        m_cta = re.search(r"N[°º]\s*([\d\-/]+)\s+CBU:\s*(\d+)", l)
+        if m_cta:
+            last_nro_cuenta = m_cta.group(1)
+            last_cbu = m_cta.group(2)
+            
+        m_saldo = re.search(r"Saldo Inicial\s+\$\s*([\d.,]+)", l)
+        if m_saldo:
+            last_saldo_inicial = parse_monto(m_saldo.group(1))
 
-    for l in todas:
-        m = re.search(r"N[°º]\s*([\d\-/]+)\s+CBU:\s*(\d+)", l)
-        if m:
-            cta = m.group(1)
-            cbu = m.group(2)
-            if cta != cuenta_actual:
-                cuenta_actual = cta
-                if cta not in cuentas:
-                    cuentas[cta] = {"nro_cuenta": cta, "cbu": cbu, "saldo_inicial": None, "lineas": []}
-        if cuenta_actual:
-            cuentas[cuenta_actual]["lineas"].append(l)
+        # 3. Lógica de atrapado de bloques (Motor principal)
+        if "Movimientos en pesos" in l:
+            if not in_movimientos:
+                in_movimientos = True
+                bloque_actual = []
+            continue
+            
+        if in_movimientos:
+            if "Saldo total" in l:
+                in_movimientos = False
+                bloques.append({
+                    "nro_cuenta": last_nro_cuenta,
+                    "cbu": last_cbu,
+                    "saldo_inicial": last_saldo_inicial,
+                    "lineas": bloque_actual
+                })
+                last_saldo_inicial = None # Reseteamos por si la próxima cuenta no lo tiene
+            else:
+                s = l.strip()
+                # Filtramos basura de la paginación y encabezados repetidos
+                if s and not re.match(r"^\d+\s*-\s*\d+$", s) and not ("Fecha" in s and "Comprobante" in s) and not ("Cuenta Corriente" in s and "CBU" in s) and not s.startswith("* Salvo"):
+                    bloque_actual.append(s)
 
-    # 3. Procesar cada cuenta individualmente
+    # Por si el PDF termina abruptamente sin la frase "Saldo total"
+    if in_movimientos and bloque_actual:
+        bloques.append({
+            "nro_cuenta": last_nro_cuenta,
+            "cbu": last_cbu,
+            "saldo_inicial": last_saldo_inicial,
+            "lineas": bloque_actual
+        })
+
+    # Procesar cada bloque atrapado
     resultados = []
-    for cta, datos in cuentas.items():
-        for l in datos["lineas"]:
-            m = re.search(r"Saldo Inicial\s+\$\s*([\d.,]+)", l)
-            if m and datos["saldo_inicial"] is None:
-                datos["saldo_inicial"] = parse_monto(m.group(1))
-
-        movimientos = procesar_lineas_movimientos(datos["lineas"], datos["saldo_inicial"])
-
+    for i, blk in enumerate(bloques):
+        movimientos = procesar_lineas_movimientos(blk["lineas"], blk["saldo_inicial"])
+        
+        # Si no encontró N° de cuenta, le ponemos uno genérico para no perder la data
+        cta_name = blk["nro_cuenta"] if blk["nro_cuenta"] else f"Desconocida_{i+1}"
+        
         info_completa = {
             **info_global,
-            "nro_cuenta": datos["nro_cuenta"],
-            "cbu": datos["cbu"],
-            "saldo_inicial": datos["saldo_inicial"]
+            "nro_cuenta": cta_name,
+            "cbu": blk["cbu"],
+            "saldo_inicial": blk["saldo_inicial"]
         }
-
+        
         if movimientos:
             resultados.append({"info": info_completa, "movimientos": movimientos})
 
@@ -285,23 +306,22 @@ if uploaded_files:
                     resultados = extraer_pdf_multicuenta(file)
                     
                     if resultados:
-                        st.success(f"✅ {file.name} escaneado: ¡Se detectaron {len(resultados)} cuenta(s) adentro!")
+                        st.success(f"✅ {file.name} escaneado: ¡Se detectaron {len(resultados)} bloque(s) de movimientos!")
                         
-                        # Generar un botón de descarga por cada cuenta encontrada
-                        for res in resultados:
+                        for i, res in enumerate(resultados):
                             info = res["info"]
                             movs = res["movimientos"]
                             excel_buffer = crear_excel_buffer(info, movs)
                             
                             cuenta_limpia = info['nro_cuenta'].replace('/', '-')
-                            nombre_excel = f"Extracto_{cuenta_limpia}.xlsx"
+                            nombre_excel = f"Extracto_{cuenta_limpia}_{i+1}.xlsx"
                             
                             st.download_button(
                                 label=f"📥 Descargar Excel — Cuenta {info['nro_cuenta']} ({len(movs)} movs)",
                                 data=excel_buffer,
                                 file_name=nombre_excel,
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key=f"{file.name}_{cuenta_limpia}" # ID único para que Streamlit no se confunda
+                                key=f"{file.name}_btn_{i}"
                             )
                     else:
                         st.warning(f"⚠️ No se detectaron movimientos en {file.name}.")
