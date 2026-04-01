@@ -174,14 +174,23 @@ def extraer_cuentas_del_pdf(pdf_file) -> tuple[dict, list[dict]]:
 # ── Parser de movimientos ─────────────────────────────────────────────────────
 def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
     """
-    Convierte lineas de texto a lista de movimientos.
-    Usa validación matemática (saldo anterior ± importe = saldo posterior)
-    para determinar débito vs crédito sin depender del nombre del movimiento.
+    Convierte líneas de texto a lista de movimientos.
+
+    Patrón real del PDF Santander:
+      LÍNEA A: [DD/MM/AA] [comprobante] descripcion  $importe  $saldo
+      LÍNEA B: beneficiario/referencia  (sin montos, opcional)
+      LÍNEA C: DD/MM/AA sola            ← fecha del movimiento de LÍNEA A cuando no viene en ella
+
+    La fecha suelta que aparece DESPUÉS de un bloque de movimiento
+    pertenece a ese movimiento, no al siguiente.
+
+    Clasificación débito/crédito por validación matemática:
+      saldo_anterior + importe = saldo_posterior
+      Si la diferencia es positiva → crédito; negativa → débito.
     """
     RE_M = RE_MONTO_AR if moneda == "$" else RE_MONTO_USD
-    movimientos = []
+    movimientos: list[dict] = []
     saldo_actual: float | None = None
-    fecha_corr = ""
     i = 0
 
     # ── Saldo inicial ────────────────────────────────────────────────────────
@@ -191,18 +200,16 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
             if ms:
                 saldo_actual = parse_monto(ms[-1])
                 mf = RE_FECHA.search(l)
-                fecha_inicial = mf.group(0) if mf else ""
                 movimientos.append({
-                    "fecha": fecha_inicial,
-                    "comprobante": "",
-                    "descripcion": "Saldo Inicial",
-                    "debito": None,
-                    "credito": None,
-                    "saldo": saldo_actual,
-                    "categoria": "Saldo Inicial",
-                    "sin_fecha": not bool(fecha_inicial),
+                    "fecha":        mf.group(0) if mf else "",
+                    "comprobante":  "",
+                    "descripcion":  "Saldo Inicial",
+                    "debito":       None,
+                    "credito":      None,
+                    "saldo":        saldo_actual,
+                    "categoria":    "Saldo Inicial",
+                    "sin_fecha":    not bool(mf),
                 })
-                fecha_corr = fecha_inicial
                 i = j + 1
             break
 
@@ -217,24 +224,23 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
             continue
         if re.match(r"^total\b", l.lower()):
             break
-
+        # Fecha suelta que no pertenece a ningún bloque en curso → ignorar
         if RE_FECHA.match(l):
-            fecha_corr = l
             continue
 
         montos_raw = RE_M.findall(l)
         if not montos_raw:
-            # Línea de beneficiario/referencia → agregar al movimiento anterior
+            # Texto de beneficiario/referencia: agregar al movimiento anterior
             if movimientos and movimientos[-1]["categoria"] != "Saldo Inicial":
                 movimientos[-1]["descripcion"] += " | " + l
                 movimientos[-1]["categoria"] = categorizar(movimientos[-1]["descripcion"])
             continue
 
-        # ── Línea con montos ─────────────────────────────────────────────────
-        sin_m = RE_M.sub("", l).strip()
+        # ── Línea con montos: es un movimiento ──────────────────────────────
+        sin_m  = RE_M.sub("", l).strip()
         tokens = sin_m.split()
         fecha = comp = ""
-        desc_t = []
+        desc_t: list[str] = []
         for t in tokens:
             if not fecha and RE_FECHA.match(t):
                 fecha = t
@@ -242,60 +248,67 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
                 comp = t
             else:
                 desc_t.append(t)
-
-        if not fecha:
-            fecha = fecha_corr
         desc = " ".join(desc_t).strip()
 
-        # Capturar línea siguiente si es texto sin montos
-        if i < len(lineas):
-            sig = lineas[i].strip()
-            if (sig
-                    and not RE_M.findall(sig)
-                    and not RE_FECHA.match(sig)
-                    and not RE_PAG.match(sig)
-                    and not re.match(r"^total\b", sig.lower())):
-                desc = (desc + " | " + sig) if desc else sig
-                i += 1
+        # Mirar las líneas siguientes para capturar beneficiario y/o fecha suelta
+        # Patrón: [beneficiario_texto?] [fecha_sola?]
+        # La fecha suelta cierra el bloque del movimiento actual.
+        j = i
+        while j < len(lineas):
+            sig = lineas[j].strip()
+            if not sig or RE_PAG.match(sig):
+                j += 1
+                continue
+            if re.match(r"^total\b", sig.lower()):
+                break
+            if RE_M.findall(sig):
+                # Siguiente movimiento con montos → salir sin consumir
+                break
+            if RE_FECHA.match(sig):
+                # Fecha suelta: asignar al movimiento actual si no tenía
+                if not fecha:
+                    fecha = sig
+                j += 1  # consumir la línea de fecha
+                break
+            # Es texto de beneficiario/referencia
+            desc = (desc + " | " + sig) if desc else sig
+            j += 1
+            # Después del beneficiario puede venir una fecha suelta: continuar el loop
+        i = j
 
-        vals = [parse_monto(m) for m in montos_raw]
-        vals = [v for v in vals if v is not None]
-
+        # ── Parsear importes ─────────────────────────────────────────────────
+        vals = [parse_monto(m) for m in montos_raw if parse_monto(m) is not None]
         debito = credito = saldo = None
 
         if len(vals) >= 2:
-            importe  = vals[-2]
-            saldo    = vals[-1]
-            abs_imp  = abs(importe)
+            importe = vals[-2]
+            saldo   = vals[-1]
+            abs_imp = abs(importe)
 
-            # ── Validación matemática (método principal) ─────────────────────
-            clasificado = False
+            # 1. Validación matemática (principal)
             if saldo_actual is not None:
                 dif = round(saldo - saldo_actual, 2)
                 if abs(abs(dif) - round(abs_imp, 2)) < 0.02:
-                    if dif > 0:
-                        credito = abs_imp
-                    else:
-                        debito = abs_imp
-                    clasificado = True
-
-            # ── Fallback: keywords + signo ────────────────────────────────────
-            if not clasificado:
-                desc_l = desc.lower()
-                if "rescate" in desc_l:
-                    credito = abs_imp
-                elif "suscripcion" in desc_l or "suscripción" in desc_l:
-                    debito = abs_imp
-                elif importe < 0:
-                    debito = abs_imp
+                    credito = abs_imp if dif > 0 else None
+                    debito  = abs_imp if dif <= 0 else None
                 else:
-                    # En CC Santander la mayoría de movimientos sin signo son débitos
-                    # excepto los que tienen "credito", "recibida", "credi" en descripción
-                    if any(kw in desc_l for kw in ("recibida", "credi transf", "crédito transf",
-                                                    "credito transf", "rescate", "liquidacion titulos publicos credi")):
+                    # 2. Fallback por descripción / signo
+                    desc_l = desc.lower()
+                    if "rescate" in desc_l:
+                        credito = abs_imp
+                    elif "suscripcion" in desc_l or "suscripción" in desc_l:
+                        debito = abs_imp
+                    elif importe < 0:
+                        debito = abs_imp
+                    elif any(k in desc_l for k in (
+                        "recibida", "credi transf", "crédito transf",
+                        "credito transf", "liquidacion titulos publicos credi",
+                    )):
                         credito = abs_imp
                     else:
                         debito = abs_imp
+            else:
+                debito = abs_imp  # sin saldo anterior, asumir débito
 
         elif vals:
             saldo = vals[0]
@@ -304,14 +317,14 @@ def procesar_lineas(lineas: list[str], moneda: str = "$") -> list[dict]:
             saldo_actual = saldo
 
         movimientos.append({
-            "fecha": fecha,
+            "fecha":       fecha,
             "comprobante": comp,
             "descripcion": desc,
-            "debito": debito,
-            "credito": credito,
-            "saldo": saldo,
-            "categoria": categorizar(desc),
-            "sin_fecha": fecha == "",
+            "debito":      debito,
+            "credito":     credito,
+            "saldo":       saldo,
+            "categoria":   categorizar(desc),
+            "sin_fecha":   fecha == "",
         })
 
     return movimientos
